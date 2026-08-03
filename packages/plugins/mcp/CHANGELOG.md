@@ -1,5 +1,15 @@
 # @executor-js/plugin-mcp
 
+## 1.5.38
+
+### Patch Changes
+
+- Updated dependencies [[`1de85fc`](https://github.com/UsefulSoftwareCo/executor/commit/1de85fc0201c0c23c0e71e003c49228d406af6c8)]:
+  - @executor-js/react@1.4.58
+  - @executor-js/sdk@1.5.38
+  - @executor-js/config@1.5.38
+  - @executor-js/api@1.4.58
+
 ## 1.5.37
 
 ### Patch Changes
