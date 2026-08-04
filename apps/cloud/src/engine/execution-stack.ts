@@ -62,6 +62,10 @@ const cloudPluginFactory = executorConfig.plugins as (deps: {
     readonly apiUrl?: string;
   };
   readonly activeToolkitSlug?: string;
+  readonly agentRegistry?: {
+    readonly baseUrl?: string;
+    readonly token?: string;
+  };
 }) => readonly AnyPlugin[];
 
 // Fresh plugin instances per request, carrying the Worker env's WorkOS Vault
@@ -76,6 +80,10 @@ export const CloudPluginsProvider: Layer.Layer<PluginsProvider> = Layer.succeed(
       },
       activeToolkitSlug:
         context?.mcpResource?.kind === "toolkit" ? context.mcpResource.slug : undefined,
+      agentRegistry: {
+        baseUrl: env.AGENTREGISTRY_URL,
+        token: env.AGENTREGISTRY_TOKEN,
+      },
     }),
 });
 

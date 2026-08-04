@@ -12,6 +12,7 @@ import { mcpHttpPlugin } from "@executor-js/plugin-mcp/api";
 import { graphqlHttpPlugin } from "@executor-js/plugin-graphql/api";
 import { workosVaultPlugin, type WorkOSVaultClient } from "@executor-js/plugin-workos-vault";
 import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
+import { agentRegistryPlugin } from "@executor-js/plugin-agentregistry/server";
 
 // ---------------------------------------------------------------------------
 // Single source of truth for the cloud app's plugin list.
@@ -48,10 +49,19 @@ interface CloudPluginDeps {
    *  falls back to the credential-driven default. */
   readonly workosVaultClient?: WorkOSVaultClient;
   readonly activeToolkitSlug?: string;
+  readonly agentRegistry?: {
+    readonly baseUrl?: string;
+    readonly token?: string;
+  };
 }
 
 export default defineExecutorConfig({
-  plugins: ({ workosCredentials, workosVaultClient, activeToolkitSlug }: CloudPluginDeps = {}) =>
+  plugins: ({
+    workosCredentials,
+    workosVaultClient,
+    activeToolkitSlug,
+    agentRegistry,
+  }: CloudPluginDeps = {}) =>
     [
       openApiHttpPlugin({
         presets: [...googleCatalog, ...microsoftCatalog],
@@ -62,6 +72,7 @@ export default defineExecutorConfig({
       }),
       graphqlHttpPlugin(),
       toolkitsPlugin({ activeToolkitSlug }),
+      agentRegistryPlugin(agentRegistry),
       workosVaultPlugin({
         credentials: workosCredentials ?? { apiKey: "", clientId: "" },
         ...(workosVaultClient ? { client: workosVaultClient } : {}),

@@ -28,6 +28,9 @@ client.
   set of tools.
 - **Governed by policy.** Each tool is allowed, gated behind approval, or
   blocked, with sensible defaults derived from the spec.
+- **Agent infrastructure registry.** Curate, discover, version, and deploy
+  agents, MCP servers, skills, prompts, models, plugins, and runtimes through
+  the integrated AgentRegistry MCP tools and web console.
 - **Run it your way.** Local CLI, a desktop app, hosted Executor Cloud, or
   self-hosted on Docker or Cloudflare. Same functionality, different packaging.
 

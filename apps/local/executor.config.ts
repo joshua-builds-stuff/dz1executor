@@ -15,6 +15,7 @@ import { fileSecretsPlugin } from "@executor-js/plugin-file-secrets";
 import { onepasswordHttpPlugin } from "@executor-js/plugin-onepassword/api";
 import { desktopSettingsPlugin } from "@executor-js/plugin-desktop-settings/server";
 import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
+import { agentRegistryPlugin } from "@executor-js/plugin-agentregistry/server";
 
 // ---------------------------------------------------------------------------
 // Single source of truth for the local app's plugin list.
@@ -39,6 +40,10 @@ export default defineExecutorConfig({
       mcpHttpPlugin({ dangerouslyAllowStdioMCP: true }),
       graphqlHttpPlugin(),
       toolkitsPlugin({ activeToolkitSlug }),
+      agentRegistryPlugin({
+        webBaseUrl:
+          process.env.EXECUTOR_WEB_BASE_URL ?? `http://localhost:${process.env.PORT ?? "4788"}`,
+      }),
       // The durable file store must register before keychain: the first
       // writable provider becomes the default for minted OAuth tokens, and on
       // sandbox/headless hosts the keychain is an in-memory keyring that a

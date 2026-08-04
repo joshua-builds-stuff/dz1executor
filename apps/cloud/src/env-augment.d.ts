@@ -61,6 +61,10 @@ declare global {
       /** Optional WorkOS base-URL override (WorkOS emulator in tests/dev). */
       WORKOS_API_URL?: string;
 
+      // AgentRegistry plugin. The token remains server-side.
+      AGENTREGISTRY_URL?: string;
+      AGENTREGISTRY_TOKEN?: string;
+
       // MCP
       EXECUTOR_MCP_DEBUG?: string;
       MCP_AUTHKIT_DOMAIN?: string;

@@ -1,0 +1,78 @@
+---
+title: AgentRegistry
+description: Curate, discover, and deploy agent infrastructure through Executor MCP and the web UI.
+---
+
+Executor includes AgentRegistry as a first-party plugin. AgentRegistry remains the
+source of truth for registry resources and deployment reconciliation; Executor
+remains the source of truth for integrations, connections, secrets, execution,
+and tool policies. Where the two products overlap, Executor behavior and
+contracts take precedence.
+
+## Connect a registry
+
+Local Executor connects to AgentRegistry's default address automatically:
+
+```bash
+AGENTREGISTRY_URL=http://127.0.0.1:12121 executor web --foreground
+```
+
+Set `AGENTREGISTRY_TOKEN` when the registry requires bearer authentication. The
+token stays on the Executor server and is never included in the browser plugin
+configuration or MCP results.
+
+The self-hosted Docker Compose stack starts AgentRegistry and PostgreSQL with
+Executor and configures the private service URL automatically. Set
+`AGENTREGISTRY_URL` to use an existing deployment instead.
+
+## Web UI
+
+Choose **AgentRegistry** in the Executor sidebar. The registry console provides:
+
+- Browsing, search, pagination, detail/status inspection, and deletion for
+  Agents, MCP Servers, Skills, Prompts, Models, Plugins, Runtimes, and Deployments.
+- Declarative create/update with JSON or multi-document YAML, including dry-run
+  admission validation.
+- A complete native API console for CRUD, MCP Registry v0.1 compatibility,
+  deployment logs, health, metrics, and logging operations.
+
+Deployment manifests use AgentRegistry's normal reconciliation pipeline, so
+local Docker, Kubernetes, agentgateway, discovery, status, and undeploy behavior
+remain owned by AgentRegistry rather than being reimplemented in Executor.
+
+## MCP tools
+
+Executor publishes these governed tools through its existing MCP endpoint:
+
+| Tool                                                    | Capability                                                                             |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `executor.agentregistry.registry.resources.list`        | Discover every resource kind with namespace, label, origin, search, and cursor filters |
+| `executor.agentregistry.registry.resources.get`         | Get latest, tagged, or mutable resources                                               |
+| `executor.agentregistry.registry.resources.apply`       | Apply one or many resources, with optional dry run                                     |
+| `executor.agentregistry.registry.resources.deleteBatch` | Declaratively delete one or many resources                                             |
+| `executor.agentregistry.registry.resources.delete`      | Delete a tagged or mutable resource                                                    |
+| `executor.agentregistry.registry.deployments.logs`      | Read deployment logs                                                                   |
+| `executor.agentregistry.registry.health`                | Inspect registry health                                                                |
+| `executor.agentregistry.registry.openConsole`           | Hand a user off to the native Executor page                                            |
+| `executor.agentregistry.registry.request`               | Access any current or future native AgentRegistry API operation                        |
+
+Mutating tools and the low-level request tool require Executor approval by
+default. Executor policies can approve, block, or continue to require approval
+for narrower tool patterns.
+
+## Functional coverage
+
+The semantic tools and web UI cover the ordinary workflows. The allowlisted
+low-level API bridge preserves the full server surface, including:
+
+- Tagged catalog CRUD and tag listing for Agents, MCP Servers, Skills, Prompts,
+  Models, and Plugins.
+- Mutable Runtime and Deployment apply/get/list/delete operations.
+- Batch apply/delete, dry-run admission, controller status, deployment logs,
+  local and Kubernetes runtime reconciliation, and discovered deployments.
+- Official MCP Registry v0.1 list/version compatibility endpoints.
+- Ping, health, version, metrics, and runtime log-level controls.
+
+Only AgentRegistry-owned paths are accepted. Arbitrary URLs, path traversal,
+query strings embedded in paths, and redirects are rejected; query parameters
+must be supplied separately.

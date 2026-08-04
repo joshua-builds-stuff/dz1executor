@@ -48,6 +48,8 @@ export const makeCloudflarePluginsProvider = (
         activeToolkitSlug:
           context?.mcpResource?.kind === "toolkit" ? context.mcpResource.slug : undefined,
         allowLocalNetwork: config.allowLocalNetwork,
+        agentRegistryUrl: config.agentRegistryUrl,
+        agentRegistryToken: config.agentRegistryToken,
       }),
   });
 

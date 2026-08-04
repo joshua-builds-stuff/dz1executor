@@ -1,4 +1,6 @@
-# Self-hosted Executor, single container, no external services.
+# Self-hosted Executor image. The repository Compose file pairs it with the
+# integrated AgentRegistry and PostgreSQL services; a standalone container can
+# instead point AGENTREGISTRY_URL at an existing registry.
 # Build context is the repo root because Bun workspaces need every member:
 #   docker build -f apps/host-selfhost/Dockerfile -t executor-selfhost .
 #
@@ -24,7 +26,7 @@ RUN cd apps/host-selfhost && bun run build
 FROM gcr.io/distroless/cc-debian12 AS runtime
 WORKDIR /app
 LABEL org.opencontainers.image.source="https://github.com/UsefulSoftwareCo/executor" \
-      org.opencontainers.image.description="Single-container self-hosted Executor" \
+      org.opencontainers.image.description="Self-hosted Executor with AgentRegistry integration" \
       org.opencontainers.image.licenses="MIT"
 ENV NODE_ENV=production \
     EXECUTOR_HOST=0.0.0.0 \

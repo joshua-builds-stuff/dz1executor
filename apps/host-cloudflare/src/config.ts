@@ -49,6 +49,8 @@ export interface CloudflareEnv {
   readonly EXECUTOR_SECRET_KEY?: string;
   readonly ALLOW_LOCAL_NETWORK?: string;
   readonly VITE_PUBLIC_SITE_URL?: string;
+  readonly AGENTREGISTRY_URL?: string;
+  readonly AGENTREGISTRY_TOKEN?: string;
   /**
    * Dev/single-user escape hatch: when "true", skip Cloudflare Access entirely
    * and treat every request as a fixed admin. For local `wrangler dev` and
@@ -74,6 +76,8 @@ export interface CloudflareConfig {
    *  static URL — the per-request origin is used instead (see RequestWebOrigin). */
   readonly webBaseUrl?: string;
   readonly enableDevAuth: boolean;
+  readonly agentRegistryUrl?: string;
+  readonly agentRegistryToken?: string;
 }
 
 type CloudflareConfigEnv = Omit<
@@ -174,5 +178,7 @@ export const loadConfig = (env: CloudflareConfigEnv): CloudflareConfig => {
     // mirroring self-host (gated on enableDevAuth = local `wrangler dev`).
     webBaseUrl,
     enableDevAuth,
+    agentRegistryUrl: env.AGENTREGISTRY_URL,
+    agentRegistryToken: env.AGENTREGISTRY_TOKEN,
   };
 };

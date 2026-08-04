@@ -11,6 +11,7 @@ import { mcpHttpPlugin } from "@executor-js/plugin-mcp/api";
 import { graphqlHttpPlugin } from "@executor-js/plugin-graphql/api";
 import { encryptedSecretsPlugin } from "@executor-js/plugin-encrypted-secrets";
 import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
+import { agentRegistryPlugin } from "@executor-js/plugin-agentregistry/server";
 
 // ---------------------------------------------------------------------------
 // The Cloudflare host's plugin list — the same protocol/provider plugins as
@@ -25,7 +26,12 @@ import { toolkitsPlugin } from "@executor-js/plugin-toolkits/server";
 
 export const makeCloudflarePlugins = (
   secretKey: string,
-  options: { readonly activeToolkitSlug?: string; readonly allowLocalNetwork?: boolean } = {},
+  options: {
+    readonly activeToolkitSlug?: string;
+    readonly allowLocalNetwork?: boolean;
+    readonly agentRegistryUrl?: string;
+    readonly agentRegistryToken?: string;
+  } = {},
 ) =>
   [
     openApiHttpPlugin({
@@ -35,6 +41,10 @@ export const makeCloudflarePlugins = (
     mcpHttpPlugin({ dangerouslyAllowStdioMCP: false }),
     graphqlHttpPlugin(),
     toolkitsPlugin({ activeToolkitSlug: options.activeToolkitSlug }),
+    agentRegistryPlugin({
+      baseUrl: options.agentRegistryUrl,
+      token: options.agentRegistryToken,
+    }),
     encryptedSecretsPlugin({ key: secretKey }),
   ] as const;
 

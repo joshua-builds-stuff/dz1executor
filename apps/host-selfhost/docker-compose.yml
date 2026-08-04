@@ -3,9 +3,8 @@
 #   docker compose up -d --build      # build the image and start
 #   open http://localhost:4788        # create the admin account (first-run)
 #
-# Everything — SQLite (libSQL), QuickJS code execution, and the MCP server — runs
-# in this single container. The named volume persists the database and the
-# generated keys across restarts and upgrades. Nothing else to orchestrate.
+# Executor and its integrated AgentRegistry control plane start together. Named
+# volumes persist Executor's libSQL data and AgentRegistry's PostgreSQL catalog.
 #
 # No configuration is required: a bare `docker compose up` boots a working
 # instance and walks you through creating the admin account in the browser.
@@ -25,8 +24,13 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      AGENTREGISTRY_URL: ${AGENTREGISTRY_URL:-http://agentregistry:8080}
     volumes:
       - executor-data:/data
+    depends_on:
+      agentregistry:
+        condition: service_healthy
     healthcheck:
       test:
         - CMD
@@ -38,5 +42,48 @@ services:
       retries: 5
       start_period: 20s
 
+  agentregistry-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agentregistry
+      POSTGRES_USER: agentregistry
+      POSTGRES_PASSWORD: agentregistry
+    volumes:
+      - agentregistry-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentregistry -d agentregistry"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  agentregistry:
+    image: ghcr.io/agentregistry-dev/agentregistry/server:${AGENTREGISTRY_VERSION:-v0.4.0}
+    restart: unless-stopped
+    environment:
+      AGENT_REGISTRY_DATABASE_URL: postgres://agentregistry:agentregistry@agentregistry-db:5432/agentregistry?sslmode=disable
+      AGENT_REGISTRY_SERVER_ADDRESS: :8080
+      AGENT_REGISTRY_AGENT_GATEWAY_PORT: "21212"
+      AGENT_REGISTRY_MCP_PORT: "31313"
+      AGENT_REGISTRY_ENABLE_REGISTRY_VALIDATION: "false"
+      AGENT_REGISTRY_PLATFORM_MODE: docker
+      AGENT_REGISTRY_MCP_REGISTRY_COMPAT_ENABLED: "true"
+    ports:
+      - "12121:8080"
+      - "31313:31313"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp:/tmp
+    depends_on:
+      agentregistry-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/v0/ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
 volumes:
   executor-data:
+  agentregistry-data:
