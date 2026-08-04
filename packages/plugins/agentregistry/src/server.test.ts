@@ -3,7 +3,13 @@ import { Effect } from "effect";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { agentRegistryPlugin, requestAgentRegistry, validateAgentRegistryPath } from "./server";
+import {
+  agentRegistryPlugin,
+  discoverFromGitHub,
+  requestAgentRegistry,
+  reviewGitHubUpdate,
+  validateAgentRegistryPath,
+} from "./server";
 
 describe("agentRegistryPlugin", () => {
   it("contributes the complete AgentRegistry MCP surface", () => {
@@ -32,6 +38,38 @@ describe("agentRegistryPlugin", () => {
     expect(() => validateAgentRegistryPath("/v0/../admin")).toThrow();
     expect(() => validateAgentRegistryPath("/v0/agents?namespace=all")).toThrow();
   });
+
+  // Both GitHub-backed operations validate the pasted URL before opening a
+  // socket, so an unusable URL costs nothing and explains itself.
+  it.effect("rejects a non-GitHub URL without calling out", () =>
+    discoverFromGitHub(
+      { apiBaseUrl: "http://127.0.0.1:1" },
+      {
+        url: "https://gitlab.com/owner/repo",
+        kind: "skills",
+      },
+    ).pipe(
+      Effect.flip,
+      Effect.map((failure) => {
+        expect(failure.status).toBe(400);
+        expect(failure.message).toContain("Only github.com repositories are supported.");
+      }),
+    ),
+  );
+
+  it.effect("rejects a path that escapes the repository", () =>
+    reviewGitHubUpdate(
+      { apiBaseUrl: "http://127.0.0.1:1" },
+      {
+        url: "https://github.com/owner/repo/tree/main/../../etc",
+      },
+    ).pipe(
+      Effect.flip,
+      Effect.map((error) => {
+        expect(error.status).toBe(400);
+      }),
+    ),
+  );
 
   it.effect("forwards query, body, and server-side authentication", () =>
     Effect.acquireUseRelease(

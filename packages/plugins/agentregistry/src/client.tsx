@@ -4,14 +4,23 @@ import { createPluginAtomClient, defineClientPlugin, useAtomSet } from "@executo
 
 import {
   AGENTREGISTRY_RESOURCE_KINDS,
+  GITHUB_SOURCED_KINDS,
   AgentRegistryApi,
   type AgentRegistryRequest,
   type AgentRegistryResponse,
+  type GitHubCandidate,
+  type GitHubDiscoverResponse,
+  type GitHubSourcedKind,
+  type ReviewResponse,
+  type SecurityFinding,
 } from "./shared";
+import { toManifest, toManifestStream, toRegistryName } from "./discovery";
 
 const AgentRegistryClient = createPluginAtomClient(AgentRegistryApi);
 const configMutation = AgentRegistryClient.mutation("agentregistry", "config");
 const requestMutation = AgentRegistryClient.mutation("agentregistry", "request");
+const discoverMutation = AgentRegistryClient.mutation("agentregistry", "discover");
+const reviewMutation = AgentRegistryClient.mutation("agentregistry", "review");
 
 type ResourceKind = (typeof AGENTREGISTRY_RESOURCE_KINDS)[number];
 type RegistryObject = {
@@ -22,6 +31,7 @@ type RegistryObject = {
     readonly name?: string;
     readonly tag?: string;
     readonly labels?: Readonly<Record<string, string>>;
+    readonly annotations?: Readonly<Record<string, string>>;
     readonly updatedAt?: string;
     readonly deletionTimestamp?: string;
   };
@@ -141,9 +151,134 @@ const formatError = (cause: unknown): string => String(cause || "AgentRegistry r
 
 const pageStyle: CSSProperties = { height: "100%", overflowY: "auto" };
 
+// --- Reading a registry object ----------------------------------------------
+//
+// Skills and Plugins nest their git source differently, and the controller may
+// or may not have resolved a commit yet. These readers collapse that into the
+// few facts the catalog and the update review need, so the JSX stays flat.
+
+const record = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+
+const stringOf = (source: Record<string, unknown>, key: string): string | undefined => {
+  const value = source[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+};
+
+const isGitHubSourced = (kind: ResourceKind): kind is GitHubSourcedKind =>
+  (GITHUB_SOURCED_KINDS as readonly string[]).includes(kind);
+
+interface SourceInfo {
+  readonly url?: string;
+  readonly branch?: string;
+  readonly commit?: string;
+  readonly subfolder?: string;
+  readonly author?: string;
+  readonly manifestPath?: string;
+}
+
+/**
+ * Where a resource came from. `spec` is authoritative; the annotations written
+ * at quick-add time fill in what the registry has no field for (branch, author),
+ * and `status.resolvedSource` wins on commit because it is what the controller
+ * actually checked out.
+ */
+const sourceOf = (item: RegistryObject): SourceInfo => {
+  const spec = record(item.spec);
+  const source = record(spec.source);
+  const repository = record(record(source.git).repository ?? source.repository);
+  const annotations = record(item.metadata?.annotations);
+  const resolved = record(record(item.status).resolvedSource);
+  return {
+    url: stringOf(repository, "url") ?? stringOf(annotations, "executor.dev/source-url"),
+    branch: stringOf(repository, "branch") ?? stringOf(annotations, "executor.dev/source-branch"),
+    commit:
+      stringOf(resolved, "commit") ??
+      stringOf(repository, "commit") ??
+      stringOf(annotations, "executor.dev/source-commit"),
+    subfolder:
+      stringOf(repository, "subfolder") ?? stringOf(annotations, "executor.dev/source-subfolder"),
+    author: stringOf(annotations, "executor.dev/source-author"),
+    manifestPath: stringOf(annotations, "executor.dev/source-manifest"),
+  };
+};
+
+const describe = (item: RegistryObject): string | undefined =>
+  stringOf(record(item.spec), "description");
+
+const titleOf = (item: RegistryObject): string | undefined => stringOf(record(item.spec), "title");
+
+const shortCommit = (commit?: string): string | undefined => commit?.slice(0, 7);
+
+/**
+ * The resource re-pinned to a new commit.
+ *
+ * The existing spec is carried through rather than rebuilt, so fields this UI
+ * does not model — anything the registry or another tool added — survive the
+ * update. Only the commit and its provenance annotations move.
+ */
+const repinned = (
+  item: RegistryObject,
+  kind: GitHubSourcedKind,
+  review: ReviewResponse,
+): Record<string, unknown> => {
+  const spec = { ...record(item.spec) };
+  const source = { ...record(spec.source) };
+  const nested = source.git !== undefined;
+  const repository = { ...record(nested ? record(source.git).repository : source.repository) };
+  repository.commit = review.headCommit;
+  repository.branch = review.branch;
+  spec.source = nested
+    ? { ...source, git: { ...record(source.git), repository } }
+    : { ...source, repository };
+  return {
+    apiVersion: item.apiVersion ?? "ar.dev/v1alpha1",
+    kind: item.kind ?? (kind === "skills" ? "Skill" : "Plugin"),
+    metadata: {
+      name: item.metadata?.name,
+      ...(item.metadata?.namespace ? { namespace: item.metadata.namespace } : {}),
+      ...(item.metadata?.tag ? { tag: item.metadata.tag } : {}),
+      annotations: {
+        ...record(item.metadata?.annotations),
+        "executor.dev/source-commit": review.headCommit,
+        "executor.dev/source-branch": review.branch,
+        "executor.dev/source-author": review.author,
+      },
+    },
+    spec,
+  };
+};
+
+const VERDICT_COPY: Record<
+  ReviewResponse["security"]["verdict"],
+  { readonly headline: string; readonly tone: string }
+> = {
+  clean: {
+    headline: "We think this is safe to run. Do you want to apply the new version?",
+    tone: "border-green-500/40 bg-green-500/10 text-green-700 dark:text-green-300",
+  },
+  review: {
+    headline: "This update needs a look before you apply it. Read the findings below, then decide.",
+    tone: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+  },
+  risky: {
+    headline:
+      "We do not think this is safe to run. Read the findings below before applying anything.",
+    tone: "border-destructive/40 bg-destructive/10 text-destructive",
+  },
+};
+
+const SEVERITY_TONE: Record<SecurityFinding["severity"], string> = {
+  high: "bg-destructive/15 text-destructive",
+  medium: "bg-amber-500/15 text-amber-700 dark:text-amber-300",
+  low: "bg-secondary text-secondary-foreground",
+};
+
 function RegistryPage() {
   const getConfig = useAtomSet(configMutation, { mode: "promise" });
   const sendRequest = useAtomSet(requestMutation, { mode: "promise" });
+  const discoverGithub = useAtomSet(discoverMutation, { mode: "promise" });
+  const reviewGithub = useAtomSet(reviewMutation, { mode: "promise" });
   const [baseUrl, setBaseUrl] = useState("AgentRegistry");
   const [authenticated, setAuthenticated] = useState(false);
   const [kind, setKind] = useState<ResourceKind>("mcpservers");
@@ -163,10 +298,28 @@ function RegistryPage() {
   const [apiContentType, setApiContentType] = useState("application/json");
   const [apiResult, setApiResult] = useState<AgentRegistryResponse>();
 
+  // Quick add: a pasted repository URL resolved into selectable candidates.
+  const [quickAddOpen, setQuickAddOpen] = useState(false);
+  const [githubUrl, setGithubUrl] = useState("");
+  const [discovery, setDiscovery] = useState<GitHubDiscoverResponse>();
+  const [chosen, setChosen] = useState<Record<string, boolean>>({});
+  const [names, setNames] = useState<Record<string, string>>({});
+  const [namespace, setNamespace] = useState("default");
+
+  // Update review for the selected catalog entry.
+  const [review, setReview] = useState<ReviewResponse>();
+  const [reviewing, setReviewing] = useState(false);
+
   const request = useCallback(
     (payload: AgentRegistryRequest) => sendRequest({ payload, reactivityKeys: [] }),
     [sendRequest],
   );
+
+  const resetQuickAdd = useCallback(() => {
+    setDiscovery(undefined);
+    setChosen({});
+    setNames({});
+  }, []);
 
   const load = useCallback(
     async (cursor?: string, append = false) => {
@@ -217,8 +370,16 @@ function RegistryPage() {
   useEffect(() => {
     setSelected(null);
     setManifest(manifestTemplate(kind));
+    setQuickAddOpen(false);
+    resetQuickAdd();
     void load();
-  }, [kind, load]);
+  }, [kind, load, resetQuickAdd]);
+
+  // A review belongs to one resource; showing a stale one against a different
+  // selection would attach the wrong diff to the wrong skill.
+  useEffect(() => {
+    setReview(undefined);
+  }, [selected]);
 
   const filteredItems = useMemo(() => {
     const needle = search.trim().toLowerCase();
@@ -250,6 +411,150 @@ function RegistryPage() {
       }
       setMessage(dryRun ? "Manifest is valid." : "Manifest applied successfully.");
       if (!dryRun) await load();
+    } catch (cause) {
+      setError(formatError(cause));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const discover = async () => {
+    if (!isGitHubSourced(kind)) return;
+    setLoading(true);
+    setError(undefined);
+    setMessage(undefined);
+    resetQuickAdd();
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: React action calling the plugin's Promise-mode atom client
+    try {
+      const response = await discoverGithub({
+        payload: { url: githubUrl, kind },
+        reactivityKeys: [],
+      });
+      setDiscovery(response);
+      setChosen(Object.fromEntries(response.candidates.map((entry) => [entry.manifestPath, true])));
+      setNames(
+        Object.fromEntries(response.candidates.map((entry) => [entry.manifestPath, entry.name])),
+      );
+    } catch (cause) {
+      setError(formatError(cause));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const applyDiscovered = async () => {
+    if (!discovery || !isGitHubSourced(kind)) return;
+    const selectedCandidates = discovery.candidates.filter(
+      (candidate) => chosen[candidate.manifestPath],
+    );
+    if (selectedCandidates.length === 0) {
+      setError("Select at least one entry to add.");
+      return;
+    }
+    const manifests = selectedCandidates.map((candidate: GitHubCandidate) =>
+      toManifest({
+        kind,
+        namespace: namespace.trim() || "default",
+        tag: "latest",
+        repositoryUrl: discovery.repositoryUrl,
+        branch: discovery.branch,
+        commit: discovery.commit,
+        author: discovery.author,
+        candidate: {
+          ...candidate,
+          name: toRegistryName(names[candidate.manifestPath] ?? candidate.name),
+        },
+      }),
+    );
+    setLoading(true);
+    setError(undefined);
+    setMessage(undefined);
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: React action calling the plugin's Promise-mode atom client
+    try {
+      const response = await request({
+        method: "POST",
+        path: "/v0/apply",
+        body: toManifestStream(manifests),
+        contentType: "application/yaml",
+      });
+      if (!response.ok) {
+        setError(`AgentRegistry returned ${response.status}: ${response.body}`);
+        return;
+      }
+      const operationFailure = applyFailure(response);
+      if (operationFailure) {
+        setError(operationFailure);
+        return;
+      }
+      setMessage(
+        `Added ${manifests.length} ${manifests.length === 1 ? singularKind[kind] : labels[kind]} from ${discovery.owner}/${discovery.repo}.`,
+      );
+      setQuickAddOpen(false);
+      resetQuickAdd();
+      await load();
+    } catch (cause) {
+      setError(formatError(cause));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const reviewSelected = async () => {
+    if (!selected) return;
+    const source = sourceOf(selected);
+    if (!source.url) {
+      setError("This entry has no git source to compare against.");
+      return;
+    }
+    setReviewing(true);
+    setError(undefined);
+    setMessage(undefined);
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: React action calling the plugin's Promise-mode atom client
+    try {
+      setReview(
+        await reviewGithub({
+          payload: {
+            url: source.url,
+            ...(source.subfolder ? { subfolder: source.subfolder } : {}),
+            ...(source.branch ? { branch: source.branch } : {}),
+            ...(source.commit ? { baseCommit: source.commit } : {}),
+            ...(source.manifestPath ? { manifestPath: source.manifestPath } : {}),
+          },
+          reactivityKeys: [],
+        }),
+      );
+    } catch (cause) {
+      setError(formatError(cause));
+    } finally {
+      setReviewing(false);
+    }
+  };
+
+  const applyReviewed = async () => {
+    if (!selected || !review || !isGitHubSourced(kind)) return;
+    setLoading(true);
+    setError(undefined);
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: React action calling the plugin's Promise-mode atom client
+    try {
+      const response = await request({
+        method: "POST",
+        path: "/v0/apply",
+        body: JSON.stringify(repinned(selected, kind, review), null, 2),
+        contentType: "application/yaml",
+      });
+      if (!response.ok) {
+        setError(`AgentRegistry returned ${response.status}: ${response.body}`);
+        return;
+      }
+      const operationFailure = applyFailure(response);
+      if (operationFailure) {
+        setError(operationFailure);
+        return;
+      }
+      setMessage(`Updated to ${shortCommit(review.headCommit)}.`);
+      setReview(undefined);
+      setSelected(null);
+      await load();
     } catch (cause) {
       setError(formatError(cause));
     } finally {
@@ -379,14 +684,129 @@ function RegistryPage() {
               >
                 Refresh
               </button>
+              {isGitHubSourced(kind) && (
+                <button
+                  type="button"
+                  onClick={() => setQuickAddOpen((open) => !open)}
+                  className="rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground"
+                >
+                  Quick add from GitHub
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => setView("manifest")}
-                className="rounded-md bg-primary px-3 py-2 text-sm text-primary-foreground"
+                className="rounded-md border border-border px-3 py-2 text-sm hover:bg-muted"
               >
                 Add {singularKind[kind]}
               </button>
             </div>
+
+            {quickAddOpen && isGitHubSourced(kind) && (
+              <section className="flex flex-col gap-3 rounded-lg border border-border p-4">
+                <div>
+                  <h2 className="font-semibold">
+                    Quick add {labels[kind].toLowerCase()} from GitHub
+                  </h2>
+                  <p className="text-sm text-muted-foreground">
+                    Paste a repository, or a link to a directory inside one. Every{" "}
+                    {kind === "skills" ? "SKILL.md" : "plugin"} found is offered below, pinned to
+                    the commit it was read from.
+                  </p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <input
+                    aria-label="GitHub URL"
+                    value={githubUrl}
+                    onChange={(event) => setGithubUrl(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") void discover();
+                    }}
+                    placeholder="https://github.com/owner/repo"
+                    className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  />
+                  <input
+                    aria-label="Namespace"
+                    value={namespace}
+                    onChange={(event) => setNamespace(event.target.value)}
+                    className="w-40 rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void discover()}
+                    className="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground"
+                    disabled={loading || githubUrl.trim().length === 0}
+                  >
+                    Find {labels[kind].toLowerCase()}
+                  </button>
+                </div>
+
+                {discovery && (
+                  <>
+                    <p className="text-sm text-muted-foreground">
+                      {discovery.owner}/{discovery.repo} · {discovery.branch} ·{" "}
+                      <span className="font-mono">{shortCommit(discovery.commit)}</span> · last
+                      commit by {discovery.author}
+                    </p>
+                    {discovery.warnings.map((warning) => (
+                      <p
+                        key={warning}
+                        className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-700 dark:text-amber-300"
+                      >
+                        {warning}
+                      </p>
+                    ))}
+                    <div className="divide-y divide-border rounded-md border border-border">
+                      {discovery.candidates.map((candidate) => (
+                        <div key={candidate.manifestPath} className="flex gap-3 p-3">
+                          <input
+                            type="checkbox"
+                            aria-label={`Include ${candidate.manifestPath}`}
+                            checked={chosen[candidate.manifestPath] ?? false}
+                            onChange={(event) =>
+                              setChosen((current) => ({
+                                ...current,
+                                [candidate.manifestPath]: event.target.checked,
+                              }))
+                            }
+                            className="mt-2"
+                          />
+                          <div className="flex min-w-0 flex-1 flex-col gap-1">
+                            <input
+                              aria-label={`Name for ${candidate.manifestPath}`}
+                              value={names[candidate.manifestPath] ?? candidate.name}
+                              onChange={(event) =>
+                                setNames((current) => ({
+                                  ...current,
+                                  [candidate.manifestPath]: event.target.value,
+                                }))
+                              }
+                              className="rounded-md border border-input bg-background px-2 py-1 font-medium text-sm"
+                            />
+                            <p className="text-sm text-muted-foreground">
+                              {candidate.description || "No description in the source manifest."}
+                            </p>
+                            <p className="font-mono text-xs text-muted-foreground">
+                              {candidate.manifestPath}
+                            </p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        onClick={() => void applyDiscovered()}
+                        className="rounded-md bg-primary px-4 py-2 text-sm text-primary-foreground"
+                        disabled={loading}
+                      >
+                        Add selected
+                      </button>
+                    </div>
+                  </>
+                )}
+              </section>
+            )}
 
             <div className="grid min-h-[420px] gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(320px,0.8fr)]">
               <section className="overflow-hidden rounded-lg border border-border">
@@ -401,6 +821,8 @@ function RegistryPage() {
                     {filteredItems.map((item, index) => {
                       const metadata = item.metadata ?? {};
                       const key = `${metadata.namespace ?? "default"}/${metadata.name ?? index}@${metadata.tag ?? ""}`;
+                      const source = sourceOf(item);
+                      const description = describe(item);
                       return (
                         <button
                           key={key}
@@ -410,7 +832,7 @@ function RegistryPage() {
                         >
                           <div className="flex items-center justify-between gap-3">
                             <span className="font-medium">
-                              {metadata.name ?? item.kind ?? "Unnamed"}
+                              {titleOf(item) ?? metadata.name ?? item.kind ?? "Unnamed"}
                             </span>
                             {metadata.tag && (
                               <span className="rounded bg-secondary px-2 py-0.5 font-mono text-xs">
@@ -418,13 +840,22 @@ function RegistryPage() {
                               </span>
                             )}
                           </div>
-                          <div className="mt-1 flex gap-3 text-xs text-muted-foreground">
+                          {description && (
+                            <p className="mt-1 line-clamp-2 text-sm text-muted-foreground">
+                              {description}
+                            </p>
+                          )}
+                          <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
                             <span>{metadata.namespace || "default"}</span>
+                            {source.author && <span>by {source.author}</span>}
+                            {metadata.updatedAt && (
+                              <span>Updated {new Date(metadata.updatedAt).toLocaleString()}</span>
+                            )}
+                            {source.commit && (
+                              <span className="font-mono">{shortCommit(source.commit)}</span>
+                            )}
                             {metadata.deletionTimestamp && (
                               <span className="text-destructive">deleting</span>
-                            )}
-                            {metadata.updatedAt && (
-                              <span>{new Date(metadata.updatedAt).toLocaleString()}</span>
                             )}
                           </div>
                         </button>
@@ -466,9 +897,177 @@ function RegistryPage() {
                         Delete
                       </button>
                     </div>
-                    <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-4 text-xs">
-                      {JSON.stringify(selected, null, 2)}
-                    </pre>
+                    <div className="min-h-0 flex-1 overflow-auto">
+                      {(() => {
+                        const source = sourceOf(selected);
+                        const description = describe(selected);
+                        return (
+                          <div className="flex flex-col gap-4 p-4">
+                            {description && <p className="text-sm">{description}</p>}
+                            <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+                              {source.author && (
+                                <>
+                                  <dt className="text-muted-foreground">Author</dt>
+                                  <dd>{source.author}</dd>
+                                </>
+                              )}
+                              {source.url && (
+                                <>
+                                  <dt className="text-muted-foreground">Source</dt>
+                                  <dd className="break-all">
+                                    {source.url}
+                                    {source.subfolder ? `/${source.subfolder}` : ""}
+                                  </dd>
+                                </>
+                              )}
+                              {source.branch && (
+                                <>
+                                  <dt className="text-muted-foreground">Branch</dt>
+                                  <dd>{source.branch}</dd>
+                                </>
+                              )}
+                              {source.commit && (
+                                <>
+                                  <dt className="text-muted-foreground">Pinned commit</dt>
+                                  <dd className="font-mono">{shortCommit(source.commit)}</dd>
+                                </>
+                              )}
+                              {selected.metadata?.updatedAt && (
+                                <>
+                                  <dt className="text-muted-foreground">Last updated</dt>
+                                  <dd>{new Date(selected.metadata.updatedAt).toLocaleString()}</dd>
+                                </>
+                              )}
+                            </dl>
+
+                            {isGitHubSourced(kind) && source.url && (
+                              <button
+                                type="button"
+                                onClick={() => void reviewSelected()}
+                                className="self-start rounded-md border border-border px-3 py-1.5 text-sm hover:bg-muted"
+                                disabled={reviewing}
+                              >
+                                {reviewing ? "Checking…" : "Check for updates"}
+                              </button>
+                            )}
+
+                            {review && (
+                              <section className="flex flex-col gap-3 rounded-md border border-border p-3">
+                                <div>
+                                  <h3 className="text-sm font-semibold">
+                                    {review.upToDate
+                                      ? "Already up to date"
+                                      : "Upstream has changed"}
+                                  </h3>
+                                  <p className="mt-1 text-xs text-muted-foreground">
+                                    {shortCommit(review.baseCommit) ?? "unpinned"} →{" "}
+                                    <span className="font-mono">
+                                      {shortCommit(review.headCommit)}
+                                    </span>
+                                    {" · "}
+                                    {review.author}
+                                    {review.authoredAt
+                                      ? ` · ${new Date(review.authoredAt).toLocaleString()}`
+                                      : ""}
+                                  </p>
+                                  {review.commitSubject && (
+                                    <p className="mt-1 text-xs italic text-muted-foreground">
+                                      {review.commitSubject}
+                                    </p>
+                                  )}
+                                </div>
+
+                                <div>
+                                  <h4 className="text-xs font-semibold uppercase text-muted-foreground">
+                                    What changed
+                                  </h4>
+                                  <ul className="mt-1 list-disc space-y-1 pl-4 text-sm">
+                                    {review.changes.map((change) => (
+                                      <li key={change}>{change}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+
+                                {!review.upToDate && (
+                                  <>
+                                    <div>
+                                      <h4 className="text-xs font-semibold uppercase text-muted-foreground">
+                                        Security check
+                                      </h4>
+                                      {review.security.findings.length === 0 ? (
+                                        <p className="mt-1 text-sm">
+                                          No known-risky patterns were found in the added lines.
+                                        </p>
+                                      ) : (
+                                        <ul className="mt-1 space-y-2">
+                                          {review.security.findings.map((finding) => (
+                                            <li
+                                              key={`${finding.title}:${finding.path}`}
+                                              className="rounded-md border border-border p-2"
+                                            >
+                                              <div className="flex items-center gap-2">
+                                                <span
+                                                  className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${SEVERITY_TONE[finding.severity]}`}
+                                                >
+                                                  {finding.severity}
+                                                </span>
+                                                <span className="text-sm font-medium">
+                                                  {finding.title}
+                                                </span>
+                                              </div>
+                                              <p className="mt-1 font-mono text-xs break-all text-muted-foreground">
+                                                {finding.path}: {finding.evidence}
+                                              </p>
+                                            </li>
+                                          ))}
+                                        </ul>
+                                      )}
+                                      <p className="mt-2 text-xs text-muted-foreground">
+                                        This is a pattern scan of the added lines, not a full
+                                        review. Read the diff yourself for anything you do not
+                                        recognise.
+                                      </p>
+                                    </div>
+
+                                    <div
+                                      className={`rounded-md border px-3 py-2 text-sm ${VERDICT_COPY[review.security.verdict].tone}`}
+                                    >
+                                      {VERDICT_COPY[review.security.verdict].headline}
+                                    </div>
+                                    <div className="flex justify-end gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => setReview(undefined)}
+                                        className="rounded-md border border-border px-3 py-1.5 text-sm hover:bg-muted"
+                                      >
+                                        Not now
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => void applyReviewed()}
+                                        className={`rounded-md px-3 py-1.5 text-sm ${review.security.verdict === "risky" ? "bg-destructive text-destructive-foreground" : "bg-primary text-primary-foreground"}`}
+                                        disabled={loading}
+                                      >
+                                        Apply new version
+                                      </button>
+                                    </div>
+                                  </>
+                                )}
+                              </section>
+                            )}
+
+                            <details>
+                              <summary className="cursor-pointer text-xs text-muted-foreground">
+                                Raw manifest
+                              </summary>
+                              <pre className="mt-2 overflow-auto whitespace-pre-wrap break-words text-xs">
+                                {JSON.stringify(selected, null, 2)}
+                              </pre>
+                            </details>
+                          </div>
+                        );
+                      })()}
+                    </div>
                   </div>
                 ) : (
                   <p className="p-5 text-sm text-muted-foreground">

@@ -8,7 +8,25 @@ import {
   AgentRegistryError,
   type AgentRegistryRequest,
   type AgentRegistryResponse,
+  type GitHubCandidate,
+  type GitHubDiscoverRequest,
+  type GitHubDiscoverResponse,
+  type ReviewRequest,
+  type ReviewResponse,
 } from "./shared";
+import {
+  fetchComparison,
+  fetchFile,
+  fetchLatestCommit,
+  fetchRepo,
+  fetchTree,
+  parseGitHubUrl,
+  repositoryUrl,
+  type GitHubClientOptions,
+  type GitHubTarget,
+} from "./github";
+import { manifestPaths, toCandidate } from "./discovery";
+import { scanSecurity, summarizeChanges, type FileChange } from "./review";
 
 export interface AgentRegistryPluginOptions {
   /** AgentRegistry server origin. Defaults to AGENTREGISTRY_URL or the local default. */
@@ -17,12 +35,18 @@ export interface AgentRegistryPluginOptions {
   readonly token?: string;
   /** Executor browser origin used by the agent-facing handoff tool. */
   readonly webBaseUrl?: string;
+  /**
+   * GitHub PAT for quick add and update review. Defaults to GITHUB_TOKEN. Without
+   * one, GitHub allows 60 anonymous requests per hour and no private repositories.
+   */
+  readonly githubToken?: string;
 }
 
 interface ResolvedOptions {
   readonly baseUrl: string;
   readonly token?: string;
   readonly webBaseUrl?: string;
+  readonly githubToken?: string;
 }
 
 const resolveOptions = (options: AgentRegistryPluginOptions): ResolvedOptions => ({
@@ -32,6 +56,7 @@ const resolveOptions = (options: AgentRegistryPluginOptions): ResolvedOptions =>
   ),
   token: options.token ?? process.env.AGENTREGISTRY_TOKEN,
   webBaseUrl: options.webBaseUrl,
+  githubToken: options.githubToken ?? process.env.GITHUB_TOKEN,
 });
 
 const allowedRootPaths = new Set(["/health", "/healthz", "/metrics", "/logging"]);
@@ -95,18 +120,234 @@ export const requestAgentRegistry = (
       }),
   });
 
+/** Ceiling on manifests resolved per discovery, reported rather than silent. */
+const MAX_CANDIDATES = 25;
+/** Ceiling on files compared per review, reported rather than silent. */
+const MAX_REVIEWED_FILES = 25;
+
+const REVIEWABLE = /\.(md|markdown|txt|json|ya?ml|toml|sh|bash|zsh|py|js|mjs|cjs|ts|rb)$/i;
+
+const invalidUrl = (message: string) => new AgentRegistryError({ message, status: 400 });
+
+const resolveTarget = (url: string): Effect.Effect<GitHubTarget, AgentRegistryError> => {
+  const parsed = parseGitHubUrl(url);
+  return parsed.ok ? Effect.succeed(parsed.target) : Effect.fail(invalidUrl(parsed.error));
+};
+
+/**
+ * Resolve a pasted URL into applicable candidates.
+ *
+ * The repository is read at one commit throughout, so a push landing mid-flight
+ * cannot produce a manifest list stitched from two different trees.
+ */
+export const discoverFromGitHub = (
+  options: GitHubClientOptions,
+  input: GitHubDiscoverRequest,
+): Effect.Effect<GitHubDiscoverResponse, AgentRegistryError> =>
+  Effect.gen(function* () {
+    const target = yield* resolveTarget(input.url);
+    const repo = yield* fetchRepo(options, target);
+    const branch = target.ref ?? repo.defaultBranch;
+    const head = yield* fetchLatestCommit(options, target, branch);
+    const tree = yield* fetchTree(options, target, head.sha);
+
+    const warnings: string[] = [];
+    if (tree.truncated) {
+      warnings.push(
+        "GitHub truncated its listing of this repository, so some nested entries may be missing. Link directly to a subdirectory to narrow the search.",
+      );
+    }
+
+    const found = manifestPaths(input.kind, tree.entries, target.subfolder);
+    const selected = found.slice(0, MAX_CANDIDATES);
+    if (found.length > selected.length) {
+      warnings.push(
+        `Found ${found.length} entries and listed the first ${selected.length}. Link to a subdirectory to reach the rest.`,
+      );
+    }
+
+    const candidates = yield* Effect.forEach(
+      selected,
+      (manifestPath) =>
+        fetchFile(options, target, head.sha, manifestPath).pipe(
+          Effect.map((body) =>
+            body === null
+              ? []
+              : [
+                  toCandidate({
+                    kind: input.kind,
+                    manifestPath,
+                    body,
+                    repoName: target.repo,
+                    repoDescription: repo.description,
+                  }),
+                ],
+          ),
+        ),
+      { concurrency: 4 },
+    ).pipe(Effect.map((results) => results.flat()));
+
+    // A plugin repository need not carry a Claude-Code manifest; the registry
+    // installs the directory either way. A skill without a SKILL.md is not a
+    // skill, so that case stays an error the operator can act on.
+    const fallback: readonly GitHubCandidate[] =
+      candidates.length === 0 && input.kind === "plugins"
+        ? [
+            {
+              name: target.subfolder?.split("/").pop() ?? target.repo,
+              description: repo.description,
+              ...(target.subfolder ? { subfolder: target.subfolder } : {}),
+              manifestPath: target.subfolder ?? "",
+              harnesses: ["codex"],
+            },
+          ]
+        : [];
+    if (fallback.length > 0) {
+      warnings.push(
+        "No .claude-plugin/plugin.json found, so the repository is offered as a single plugin. Check the name and harness before applying.",
+      );
+    }
+    if (candidates.length === 0 && fallback.length === 0) {
+      return yield* invalidUrl(
+        target.subfolder
+          ? `No SKILL.md found under ${target.subfolder} on ${branch}.`
+          : `No SKILL.md found in ${target.owner}/${target.repo} on ${branch}.`,
+      );
+    }
+
+    return {
+      repositoryUrl: repositoryUrl(target),
+      owner: target.owner,
+      repo: target.repo,
+      branch,
+      commit: head.sha,
+      author: head.author,
+      candidates: candidates.length > 0 ? candidates : fallback,
+      warnings,
+    };
+  });
+
+const pathsUnder = (paths: readonly string[], subfolder?: string): readonly string[] =>
+  paths.filter(
+    (path) =>
+      REVIEWABLE.test(path) &&
+      (subfolder === undefined || path.startsWith(`${subfolder}/`) || path === subfolder),
+  );
+
+/**
+ * Compare the pinned commit against the tip of the tracked branch.
+ *
+ * Both snapshots are fetched by commit rather than by branch, so the summary and
+ * the scan describe exactly the change the operator is being asked to accept.
+ */
+export const reviewGitHubUpdate = (
+  options: GitHubClientOptions,
+  input: ReviewRequest,
+): Effect.Effect<ReviewResponse, AgentRegistryError> =>
+  Effect.gen(function* () {
+    const target = yield* resolveTarget(input.url);
+    const repo = yield* fetchRepo(options, target);
+    const branch = input.branch ?? target.ref ?? repo.defaultBranch;
+    const subfolder = input.subfolder ?? target.subfolder;
+    const head = yield* fetchLatestCommit(options, target, branch, subfolder);
+    const upToDate = input.baseCommit === head.sha;
+
+    const base = {
+      repositoryUrl: repositoryUrl(target),
+      branch,
+      ...(input.baseCommit ? { baseCommit: input.baseCommit } : {}),
+      headCommit: head.sha,
+      author: head.author,
+      authoredAt: head.authoredAt,
+      commitSubject: head.subject,
+    };
+    if (upToDate) {
+      return {
+        ...base,
+        upToDate: true,
+        changes: ["The pinned commit is already the newest commit for this source."],
+        security: { verdict: "clean" as const, findings: [] },
+      };
+    }
+
+    // With a pinned commit, ask GitHub which files differ; without one, every
+    // file under the source is new by definition and the head tree is the list.
+    const candidatePaths = input.baseCommit
+      ? yield* fetchComparison(options, target, input.baseCommit, head.sha).pipe(
+          Effect.map((files) =>
+            pathsUnder(
+              files.map((file) => file.path),
+              subfolder,
+            ),
+          ),
+        )
+      : yield* fetchTree(options, target, head.sha).pipe(
+          Effect.map((tree) =>
+            pathsUnder(
+              tree.entries.filter((entry) => entry.type === "blob").map((entry) => entry.path),
+              subfolder,
+            ),
+          ),
+        );
+    const union = [...new Set(candidatePaths)].sort();
+    const reviewed = union.slice(0, MAX_REVIEWED_FILES);
+
+    // A compared file may be absent on either side (added or deleted); fetchFile
+    // reports that as null, which is exactly what the summary and scan expect.
+    const changes = yield* Effect.forEach(
+      reviewed,
+      (path) =>
+        Effect.all(
+          {
+            base: input.baseCommit
+              ? fetchFile(options, target, input.baseCommit, path)
+              : Effect.succeed(null),
+            head: fetchFile(options, target, head.sha, path),
+          },
+          { concurrency: 2 },
+        ).pipe(
+          Effect.map(
+            ({ base: before, head: after }): FileChange => ({ path, base: before, head: after }),
+          ),
+        ),
+      { concurrency: 4 },
+    );
+
+    // Only the source's own manifest gets frontmatter and section treatment;
+    // a plugin's manifest is JSON and falls through to the file-level summary.
+    const manifestPath = input.manifestPath ?? (subfolder ? `${subfolder}/SKILL.md` : "SKILL.md");
+    const sentences = [...summarizeChanges(changes, manifestPath)];
+    if (union.length > reviewed.length) {
+      sentences.push(
+        `Only the first ${reviewed.length} of ${union.length} text files were compared; the rest were not reviewed.`,
+      );
+    }
+    if (!input.baseCommit) {
+      sentences.unshift(
+        "This source has no previously pinned commit, so the whole of its current content is described below as new.",
+      );
+    }
+
+    return { ...base, upToDate: false, changes: sentences, security: scanSecurity(changes) };
+  });
+
 const AgentRegistryApiBundle = addGroup(AgentRegistryApi);
 
-const makeAgentRegistryExtension = (options: ResolvedOptions) => ({
-  config: () =>
-    Effect.succeed({
-      baseUrl: options.baseUrl,
-      configured: options.baseUrl.length > 0,
-      authenticated: options.token !== undefined && options.token.length > 0,
-      resourceKinds: [...AGENTREGISTRY_RESOURCE_KINDS],
-    }),
-  request: (input: AgentRegistryRequest) => requestAgentRegistry(options, input),
-});
+const makeAgentRegistryExtension = (options: ResolvedOptions) => {
+  const github: GitHubClientOptions = options.githubToken ? { token: options.githubToken } : {};
+  return {
+    config: () =>
+      Effect.succeed({
+        baseUrl: options.baseUrl,
+        configured: options.baseUrl.length > 0,
+        authenticated: options.token !== undefined && options.token.length > 0,
+        resourceKinds: [...AGENTREGISTRY_RESOURCE_KINDS],
+      }),
+    request: (input: AgentRegistryRequest) => requestAgentRegistry(options, input),
+    discover: (input: GitHubDiscoverRequest) => discoverFromGitHub(github, input),
+    review: (input: ReviewRequest) => reviewGitHubUpdate(github, input),
+  };
+};
 
 type AgentRegistryExtension = ReturnType<typeof makeAgentRegistryExtension>;
 
@@ -130,6 +371,18 @@ const AgentRegistryHandlers = HttpApiBuilder.group(
         Effect.gen(function* () {
           const extension = yield* AgentRegistryExtensionService;
           return yield* extension.request(payload);
+        }),
+      )
+      .handle("discover", ({ payload }) =>
+        Effect.gen(function* () {
+          const extension = yield* AgentRegistryExtensionService;
+          return yield* extension.discover(payload);
+        }),
+      )
+      .handle("review", ({ payload }) =>
+        Effect.gen(function* () {
+          const extension = yield* AgentRegistryExtensionService;
+          return yield* extension.review(payload);
         }),
       ),
 );
