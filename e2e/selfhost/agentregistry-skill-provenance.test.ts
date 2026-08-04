@@ -53,6 +53,33 @@ const applySkill = (name: string): Effect.Effect<void> =>
     }).then(() => undefined),
   ).pipe(Effect.ignore);
 
+/**
+ * A Skill the controller cannot resolve.
+ *
+ * The commit is deliberately omitted: AgentRegistry treats a pinned commit as
+ * already resolved and never contacts the remote, so only an unpinned source
+ * pointed at a nonexistent repository produces a real `Ready: False`.
+ */
+const applyUnresolvableSkill = (name: string): Effect.Effect<void> =>
+  Effect.promise(() =>
+    fetch(new URL("/v0/apply", agentRegistryUrl), {
+      method: "POST",
+      headers: { "Content-Type": "application/yaml" },
+      body: JSON.stringify({
+        apiVersion: "ar.dev/v1alpha1",
+        kind: "Skill",
+        metadata: { name, tag: "latest" },
+        spec: {
+          title: "Broken Source",
+          description: "Points at a repository that does not exist.",
+          // `.invalid` is reserved by RFC 2606 and never resolves, so the
+          // failure is deterministic and needs no upstream service.
+          source: { repository: { url: "https://executor-e2e.invalid/absent", branch: "main" } },
+        },
+      }),
+    }).then(() => undefined),
+  ).pipe(Effect.ignore);
+
 const removeSkill = (name: string): Effect.Effect<void> =>
   Effect.promise(() =>
     fetch(new URL(`/v0/skills/${encodeURIComponent(name)}/latest`, agentRegistryUrl), {
@@ -68,8 +95,10 @@ scenario(
     const browser = yield* Browser;
     const identity = yield* target.newIdentity();
     const name = `executor-e2e-skill-${randomBytes(5).toString("hex")}`;
+    const broken = `executor-e2e-broken-${randomBytes(5).toString("hex")}`;
 
     yield* applySkill(name);
+    yield* applyUnresolvableSkill(broken);
 
     yield* Effect.gen(function* () {
       yield* browser.session(identity, async ({ page, step }) => {
@@ -101,6 +130,23 @@ scenario(
           await page.getByText("Raw manifest").waitFor();
         });
 
+        // A resource the controller could not resolve is listed and looks
+        // installed but does nothing, so its condition has to be visible
+        // without expanding the raw manifest.
+        // A resource the controller could not resolve is listed and looks
+        // installed but does nothing, so its condition has to be visible
+        // without expanding the raw manifest.
+        await step("A resource the controller rejected says so on its face", async () => {
+          await page.getByPlaceholder("Search skills…").fill(broken);
+          const row = page.getByRole("button", { name: "Broken Source", exact: false });
+          await row.waitFor();
+          await row.getByText("not ready").waitFor();
+          await row.click();
+          // One assertion on the rendered condition line: the reason also
+          // appears in the raw manifest, so a looser match is ambiguous.
+          await page.getByText("Ready: False — SourceUnresolvable").waitFor();
+        });
+
         await step("Quick add explains a URL it cannot use", async () => {
           await page.getByRole("button", { name: "Quick add from GitHub" }).click();
           await page.getByLabel("GitHub URL").fill("https://gitlab.com/owner/repo");
@@ -115,6 +161,6 @@ scenario(
             .waitFor({ state: "detached" });
         });
       });
-    }).pipe(Effect.ensuring(removeSkill(name)));
+    }).pipe(Effect.ensuring(Effect.all([removeSkill(name), removeSkill(broken)])));
   }),
 );

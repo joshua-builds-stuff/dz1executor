@@ -210,6 +210,44 @@ const titleOf = (item: RegistryObject): string | undefined => stringOf(record(it
 
 const shortCommit = (commit?: string): string | undefined => commit?.slice(0, 7);
 
+interface Condition {
+  readonly type: string;
+  readonly status: string;
+  readonly reason?: string;
+  readonly message?: string;
+}
+
+/**
+ * The controller's own verdict on a resource.
+ *
+ * This is the first thing an operator needs: a Skill whose source will not
+ * resolve is listed and looks installed, but does nothing. Surfacing the
+ * condition beats leaving it for whoever thinks to expand the raw manifest.
+ */
+const conditionsOf = (item: RegistryObject): readonly Condition[] => {
+  const raw = record(item.status).conditions;
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((entry): Condition[] => {
+    const source = record(entry);
+    const type = stringOf(source, "type");
+    const status = stringOf(source, "status");
+    if (!type || !status) return [];
+    return [
+      {
+        type,
+        status,
+        ...(stringOf(source, "reason") ? { reason: stringOf(source, "reason")! } : {}),
+        ...(stringOf(source, "message") ? { message: stringOf(source, "message")! } : {}),
+      },
+    ];
+  });
+};
+
+/** A condition is a problem when the controller says it is not satisfied. */
+const isFailing = (condition: Condition): boolean => condition.status !== "True";
+
+const notReady = (item: RegistryObject): boolean => conditionsOf(item).some(isFailing);
+
 /**
  * The resource re-pinned to a new commit.
  *
@@ -854,6 +892,9 @@ function RegistryPage() {
                             {source.commit && (
                               <span className="font-mono">{shortCommit(source.commit)}</span>
                             )}
+                            {notReady(item) && (
+                              <span className="font-medium text-destructive">not ready</span>
+                            )}
                             {metadata.deletionTimestamp && (
                               <span className="text-destructive">deleting</span>
                             )}
@@ -903,6 +944,24 @@ function RegistryPage() {
                         const description = describe(selected);
                         return (
                           <div className="flex flex-col gap-4 p-4">
+                            {conditionsOf(selected)
+                              .filter(isFailing)
+                              .map((condition) => (
+                                <div
+                                  key={condition.type}
+                                  className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"
+                                >
+                                  <p className="font-semibold">
+                                    {condition.type}: {condition.status}
+                                    {condition.reason ? ` — ${condition.reason}` : ""}
+                                  </p>
+                                  {condition.message && (
+                                    <p className="mt-1 font-mono text-xs break-words">
+                                      {condition.message}
+                                    </p>
+                                  )}
+                                </div>
+                              ))}
                             {description && <p className="text-sm">{description}</p>}
                             <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
                               {source.author && (

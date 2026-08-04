@@ -58,7 +58,13 @@ services:
       retries: 10
 
   agentregistry:
-    image: ghcr.io/agentregistry-dev/agentregistry/server:${AGENTREGISTRY_VERSION:-v0.4.0}
+    # Published image plus git — see agentregistry.Dockerfile for why.
+    build:
+      context: .
+      dockerfile: agentregistry.Dockerfile
+      args:
+        AGENTREGISTRY_VERSION: ${AGENTREGISTRY_VERSION:-v0.4.0}
+    image: executor-agentregistry
     restart: unless-stopped
     environment:
       AGENT_REGISTRY_DATABASE_URL: postgres://agentregistry:agentregistry@agentregistry-db:5432/agentregistry?sslmode=disable
